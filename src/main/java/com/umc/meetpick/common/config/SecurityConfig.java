@@ -1,82 +1,138 @@
 package com.umc.meetpick.common.config;
 
-import com.umc.meetpick.common.jwt.*;
+import com.umc.meetpick.common.jwt.JwtUtil;
+import jakarta.servlet.ServletException;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
 import lombok.RequiredArgsConstructor;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
-import org.springframework.security.config.annotation.authentication.builders.AuthenticationManagerBuilder;
+import org.springframework.http.HttpMethod;
+import org.springframework.security.config.Customizer;
 import org.springframework.security.config.annotation.web.builders.HttpSecurity;
 import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
-import org.springframework.security.config.annotation.web.configurers.AbstractHttpConfigurer;
-import org.springframework.security.config.annotation.web.configurers.HeadersConfigurer;
-import org.springframework.security.config.http.SessionCreationPolicy;
 import org.springframework.security.web.SecurityFilterChain;
-import org.springframework.security.web.authentication.UsernamePasswordAuthenticationFilter;
-import org.springframework.web.cors.CorsConfiguration;
-import org.springframework.web.cors.CorsConfigurationSource;
-import org.springframework.web.cors.UrlBasedCorsConfigurationSource;
 
-import java.util.List;
+import java.io.IOException;
+import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
+import java.util.Map;
 
 @Configuration
 @EnableWebSecurity
 @RequiredArgsConstructor
 public class SecurityConfig {
 
-    private final CustomAccessDeniedHandler accessDeniedHandler;
-    private final CustomAuthenticationEntryPoint authenticationEntryPoint;
-    private final JwtAuthenticationFilter jwtAuthenticationFilter;
-    private final OAuth2AuthenticationSuccessHandler oAuth2AuthenticationSuccessHandler;
-    private final CustomOAuth2UserService customOAuth2UserService;
+    private final JwtUtil jwtUtil;
 
-    //TODO 리프레시 토큰 추가 및 권한 추가
+    @Value("${front.redirect-url}")
+    private String frontRedirectUrl;
 
     @Bean
-    public SecurityFilterChain securityFilterChain(HttpSecurity httpSecurity, AuthenticationManagerBuilder authenticationManagerBuilder) throws Exception {
-        return httpSecurity
-                .httpBasic(AbstractHttpConfigurer::disable) // UI를 사용하는 것을 기본값으로 가진 시큐리티 설정 비활성화
-                //.cors(AbstractHttpConfigurer::disable) // CORS 비활성화
-                .cors(cors -> cors.configurationSource(corsConfigurationSource())) //CORS 설정 추가
-                .csrf(AbstractHttpConfigurer::disable) // CSRF 비활성화
-                .headers(headers ->
-                        headers.frameOptions(HeadersConfigurer.FrameOptionsConfig::disable) // H2 콘솔을 위한 프레임 허용
+    public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+
+        http
+                .csrf(csrf -> csrf.disable())
+                .cors(Customizer.withDefaults())
+
+                .authorizeHttpRequests(auth -> auth
+                        .requestMatchers(
+                                "/",
+                                "/login",
+                                "/login/error",
+                                "/error",
+                                "/h2-console/**",
+                                "/swagger-ui/**",
+                                "/v3/api-docs/**"
+                        ).permitAll()
+                        .requestMatchers(HttpMethod.GET, "/oauth2/**").permitAll()
+                        .anyRequest().permitAll() // 로컬에서 일단 막지 말고 오픈
                 )
-                .sessionManagement((sessionManagement) ->
-                        sessionManagement.sessionCreationPolicy(SessionCreationPolicy.STATELESS)
-                ) // stateless로 설정
-                //TODO 나중에 이 부분 리팩토링
-                .oauth2Login(oauth2 -> oauth2
-                        .authorizationEndpoint(endpoint ->
-                                endpoint.baseUri("/oauth2/authorize"))
-                        .redirectionEndpoint(endpoint ->
-                                endpoint.baseUri("/login/oauth2/code/*"))
-                        .successHandler(oAuth2AuthenticationSuccessHandler) // ✅ OAuth2 성공 핸들러 설정
-                        .userInfoEndpoint(userInfo -> userInfo.userService(customOAuth2UserService))
+
+                // H2 콘솔 쓰면 frameOptions disable 필요
+                .headers(headers -> headers.frameOptions(frame -> frame.disable()))
+
+                .oauth2Login(oauth -> oauth
+                        .loginPage("/login")
+                        .failureHandler((request, response, exception) -> {
+                            // ✅ 폴더 추가 없이 여기서 바로 처리
+                            response.sendRedirect("/login/error");
+                        })
+                        .successHandler(this::oauth2Success)
                 )
-                .authorizeHttpRequests(registry -> registry
-                        .requestMatchers( "/**").permitAll()
-                        /*"/sign-api/**", "/swagger-ui/**", "/swagger-ui.html/**", "/v3/api-docs/**", "/oauth2/**", "/h2-console/**", "/api/university/**", "/api/members/random-user", "/login/**"*/
-                        .anyRequest().authenticated()) // 로그인 관련만 허용
-                // 애플리케이션에 들어오는 요청에 대한 사용권한을 체크한다.
-                .exceptionHandling((exceptionConfig) ->
-                        exceptionConfig.authenticationEntryPoint(authenticationEntryPoint).accessDeniedHandler(accessDeniedHandler)
-                ) // 인증 실패 및 권한이 없는 경우
-                .addFilterBefore(jwtAuthenticationFilter, UsernamePasswordAuthenticationFilter.class)
-                .build();
+
+                .logout(logout -> logout.disable());
+
+        return http.build();
     }
 
-    // CORS 설정을 추가 메서드
-    @Bean
-    public CorsConfigurationSource corsConfigurationSource() {
-        CorsConfiguration configuration = new CorsConfiguration();
-        configuration.setAllowedOriginPatterns(List.of("https://*.meetpick.click", "http://localhost:5173"));
-        configuration.setAllowedMethods(List.of("GET", "POST", "PUT", "DELETE", "PATCH"));
-        configuration.setAllowedHeaders(List.of("Authorization", "Content-Type")); // 허용할 헤더
-        configuration.setAllowCredentials(true); // 인증 정보 포함 허용 (JWT 사용 시 필요)
+    /**
+     * ✅ OAuth2 성공 시:
+     * 1) 카카오 userInfo에서 id / nickname 꺼내기
+     * 2) DB에서 회원 조회/생성
+     * 3) JWT 발급
+     * 4) 프론트로 redirect (front.redirect-url?token=xxx)
+     */
+    private void oauth2Success(HttpServletRequest request,
+                               HttpServletResponse response,
+                               org.springframework.security.core.Authentication authentication) throws IOException, ServletException {
 
-        UrlBasedCorsConfigurationSource source = new UrlBasedCorsConfigurationSource();
-        source.registerCorsConfiguration("/**", configuration);
-        return source;
+        Object principal = authentication.getPrincipal();
+        if (!(principal instanceof org.springframework.security.oauth2.core.user.OAuth2User oauth2User)) {
+            response.sendRedirect("/login/error");
+            return;
+        }
+
+        Map<String, Object> attributes = oauth2User.getAttributes();
+
+        // 카카오는 보통:
+        // id: Long
+        // properties.nickname 또는 kakao_account.profile.nickname 에 들어있음
+        Long kakaoId = null;
+        String nickname = null;
+
+        Object idObj = attributes.get("id");
+        if (idObj instanceof Number n) kakaoId = n.longValue();
+
+        Object propsObj = attributes.get("properties");
+        if (propsObj instanceof Map<?, ?> props) {
+            Object nickObj = props.get("nickname");
+            if (nickObj != null) nickname = String.valueOf(nickObj);
+        }
+
+        Object accountObj = attributes.get("kakao_account");
+        if (nickname == null && accountObj instanceof Map<?, ?> acc) {
+            Object profileObj = acc.get("profile");
+            if (profileObj instanceof Map<?, ?> profile) {
+                Object nickObj = profile.get("nickname");
+                if (nickObj != null) nickname = String.valueOf(nickObj);
+            }
+        }
+
+        if (kakaoId == null) {
+            response.sendRedirect("/login/error");
+            return;
+        }
+
+        // =========================
+        // ✅ 여기만 너희 프로젝트 서비스명에 맞게 변경 필요
+        // "kakaoId로 memberId 가져오기" 로직
+        // =========================
+
+        // 예시:
+        // Long memberId = memberService.findOrCreateByKakao(kakaoId, nickname);
+
+        // ⚠️ 프로젝트에 서비스가 없을 수 있으니,
+        // 일단 "kakaoId 자체를 memberId처럼" 임시로 발급해서 프론트 테스트는 가능하게 해둠
+        Long memberId = kakaoId; // 임시
+
+        String token = jwtUtil.generateToken(memberId);
+
+        String redirect = frontRedirectUrl
+                + (frontRedirectUrl.contains("?") ? "&" : "?")
+                + "token=" + URLEncoder.encode(token, StandardCharsets.UTF_8);
+
+        response.sendRedirect(redirect);
     }
-
 }
